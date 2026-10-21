@@ -147,6 +147,36 @@ class AnalyzerTests(unittest.TestCase):
             self.assertEqual(result["permissions"][0]["name"], "android.permission.INTERNET")
             self.assertEqual(result["components"][0]["exported"], "true")
 
+    def test_manifest_with_dtd_is_rejected_without_entity_expansion(self):
+        # Manifesto Android válido nunca tem DTD. Sem o bloqueio, o ElementTree
+        # expande estas entidades e um arquivo de poucos KB vira megabytes na RAM.
+        bomb = (b'<?xml version="1.0"?><!DOCTYPE lolz ['
+                b'<!ENTITY lol "lol">'
+                b'<!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">'
+                b'<!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">'
+                b'<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">'
+                b']><manifest package="&lol3;"/>')
+        with tempfile.TemporaryDirectory() as tmp:
+            apk = make_apk(Path(tmp), bomb)
+            result = analyze_manifest(apk, Path(tmp) / "out")
+        self.assertFalse(result["decoded"])
+        self.assertIn("DTD", result["reason"])
+        # Nem JADX/Apktool/aapt2 devem receber um manifesto recusado por DTD.
+        self.assertEqual(result["optional_tool_runs"], {})
+
+    def test_manifest_above_size_limit_is_reported_not_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = b"<manifest>" + b" " * 5000 + b"</manifest>"
+            apk = make_apk(Path(tmp), big)
+            with patch("readroid.analyzer.MAX_MANIFEST_BYTES", 1024):
+                inspected = inspect_apk(apk)
+                analyzed = analyze_manifest(apk, Path(tmp) / "out")
+        self.assertEqual(inspected["manifest"]["format"], "não lido (acima do limite de tamanho)")
+        self.assertTrue(any("limite" in warning for warning in inspected["warnings"]))
+        self.assertFalse(analyzed["decoded"])
+        self.assertIn("limite", analyzed["reason"])
+        self.assertEqual(analyzed["permissions"], [])
+
     def test_manifest_binary_axml_decoded_natively(self):
         with tempfile.TemporaryDirectory() as tmp:
             apk = make_apk(Path(tmp), build_axml(MANIFEST_EVENTS))
