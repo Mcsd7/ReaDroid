@@ -137,6 +137,10 @@ against terminal escape sequences; the interactive opencode screen is drawn by o
 - URLs, domains, IPs, and permissions are leads for manual review, not definitive proof of malicious behavior.
 - The string scanner enforces file size and item count limits per category to prevent excessive memory usage; the
   report notes in `truncated_categories` when a list might be incomplete.
+- The `AndroidManifest.xml` is read with a size cap (16 MB): an APK with an abnormally large manifest is reported
+  as not decoded instead of being loaded into memory. Text manifests that declare a DTD (`<!DOCTYPE`/`<!ENTITY`)
+  are rejected, because a valid Android manifest never declares entities — this blocks "billion laughs" payloads
+  that would otherwise be expanded by the XML parser.
 - Rebuilding depends on `apktool`/`zipalign`/`apksigner` (or `jarsigner`) being installed; without
   them, each step details precisely what is missing.
 - ReaDroid never modifies or signs the original APK — every rebuild generates a new file under `builds/`.

@@ -18,6 +18,9 @@ from . import __version__, axml
 MAX_ENTRY_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_SCAN_BYTES = 256 * 1024 * 1024
 MAX_REPORT_ITEMS = 3000
+# Manifestos reais têm alguns KB. O limite existe para um APK craftado não
+# conseguir carregar centenas de MB na RAM do celular com um único arquivo.
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
 URL_RE = re.compile(rb"https?://[^\s\x00\"'<>]{4,500}", re.I)
 # Lista de TLDs reais (não "qualquer coisa.palavra"), senão nomes de classe Java/Kotlin
@@ -62,6 +65,30 @@ def _run(command: list[str], timeout: int = 180) -> dict[str, Any]:
         return {"returncode": None, "stdout": "", "stderr": str(exc)}
 
 
+class ManifestTooLarge(ValueError):
+    """O AndroidManifest.xml excede o limite que o ReaDroid aceita ler."""
+
+
+def _read_manifest_entry(archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
+    """Lê o AndroidManifest.xml com teto de tamanho.
+
+    O APK é entrada não confiável: um ZIP pode declarar um manifesto de centenas
+    de MB comprimido em poucos KB. Lemos no máximo MAX_MANIFEST_BYTES (+1 byte só
+    para detectar estouro), em vez de confiar no tamanho declarado ou carregar
+    tudo na memória. Acima do limite levantamos ManifestTooLarge.
+    """
+    if info.file_size > MAX_MANIFEST_BYTES:
+        raise ManifestTooLarge(
+            f"AndroidManifest.xml declara {info.file_size} bytes, acima do limite de {MAX_MANIFEST_BYTES} bytes.")
+    with archive.open(info) as stream:
+        data = stream.read(MAX_MANIFEST_BYTES + 1)
+    if len(data) > MAX_MANIFEST_BYTES:
+        # Tamanho declarado no índice do ZIP não bate com o conteúdo entregue.
+        raise ManifestTooLarge(
+            f"AndroidManifest.xml entrega mais de {MAX_MANIFEST_BYTES} bytes de conteúdo.")
+    return data
+
+
 # Extensões que normalmente guardam um ZIP/APK válido. Não é mais um bloqueio rígido:
 # o que importa é o conteúdo (zipfile.is_zipfile), a extensão só gera um aviso.
 KNOWN_APK_EXTENSIONS = (".apk", ".apks", ".xapk", ".apk.1")
@@ -93,13 +120,19 @@ def inspect_apk(path: Path) -> dict[str, Any]:
         asset_count = sum(name.startswith("assets/") for name in names)
         manifest_info = next((item for item in infos if item.filename == "AndroidManifest.xml"), None)
         manifest_kind = "ausente"
+        warnings: list[str] = []
         if manifest_info:
             try:
-                content = archive.read(manifest_info)
+                content = _read_manifest_entry(archive, manifest_info)
                 manifest_kind = "XML texto" if content.lstrip().startswith(b"<") else "XML binário Android (AXML)"
+            except ManifestTooLarge as exc:
+                manifest_kind = "não lido (acima do limite de tamanho)"
+                warnings.append(f"{exc} Conteúdo do manifesto ignorado.")
             except (OSError, RuntimeError, zipfile.BadZipFile):
                 manifest_kind = "não foi possível ler"
         warning = extension_warning(path)
+        if warning:
+            warnings.append(warning)
         return {
             "tool": "ReaDroid", "version": __version__,
             "analyzed_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -109,7 +142,7 @@ def inspect_apk(path: Path) -> dict[str, Any]:
             "dex_files": dex_files, "native_libraries": native_libs,
             "resource_file_count": resource_count, "asset_file_count": asset_count,
             "file_list_sample": names[:500],
-            "warnings": [warning] if warning else [],
+            "warnings": warnings,
             "note": "Inspeção estática; a presença de um arquivo não prova comportamento malicioso."
         }
 
@@ -121,6 +154,16 @@ def _looks_like_text_xml(data: bytes) -> bool:
 def _parse_manifest_xml(data: bytes) -> dict[str, Any]:
     """Extrai campos básicos quando o manifesto está em XML legível."""
     result: dict[str, Any] = {"decoded": False, "permissions": [], "components": [], "application": {}}
+    # Um AndroidManifest.xml real nunca declara DTD/entidades. O ElementTree
+    # expande entidades internas, então um manifesto de poucos KB com
+    # <!ENTITY> aninhadas vira gigabytes na memória ("billion laughs").
+    # Recusamos antes de entregar os dados ao parser.
+    if b"<!DOCTYPE" in data or b"<!ENTITY" in data:
+        result["reason"] = ("Manifesto declara DTD/entidades, o que um AndroidManifest.xml válido "
+                            "nunca faz; recusado para evitar expansão de entidades.")
+        # Também não mandamos o APK para JADX/Apktool: eles parseariam o mesmo XML.
+        result["dtd_rejected"] = True
+        return result
     try:
         root = ET.fromstring(data)
     except (ET.ParseError, ValueError):
@@ -157,14 +200,26 @@ def _parse_manifest_xml(data: bytes) -> dict[str, Any]:
 
 def analyze_manifest(path: Path, output_dir: Path) -> dict[str, Any]:
     validate_apk(path)
-    manifest_data = None
+    too_large = None
     with zipfile.ZipFile(path) as archive:
         try:
-            manifest_data = archive.read("AndroidManifest.xml")
+            manifest_info = archive.getinfo("AndroidManifest.xml")
         except KeyError:
-            pass
-    if manifest_data is None:
-        raise ValueError("AndroidManifest.xml não foi encontrado dentro do APK.")
+            raise ValueError("AndroidManifest.xml não foi encontrado dentro do APK.") from None
+        try:
+            manifest_data = _read_manifest_entry(archive, manifest_info)
+        except ManifestTooLarge as exc:
+            too_large = str(exc)
+    if too_large:
+        # Devolvemos um relatório normal (em vez de exceção) para o menu salvar
+        # e mostrar o motivo, do mesmo jeito que um manifesto não decodificado.
+        return {
+            "tool": "ReaDroid", "apk": path.name, "sha256": sha256_file(path),
+            "decoded": False, "permissions": [], "components": [], "application": {},
+            "reason": f"{too_large} O manifesto não foi carregado para não consumir a memória do aparelho.",
+            "warnings": [too_large],
+            "security_note": "Manifesto fora do tamanho esperado é, por si só, um sinal para revisão manual.",
+        }
 
     parsed: dict[str, Any]
     if _looks_like_text_xml(manifest_data):
@@ -182,9 +237,12 @@ def analyze_manifest(path: Path, output_dir: Path) -> dict[str, Any]:
                       "reason": f"Falha ao decodificar o AXML nativamente ({exc}); tentando ferramentas externas."}
 
     tools: dict[str, Any] = {}
+    # Manifesto recusado por DTD/entidades não deve ser reenviado a outra
+    # ferramenta que faria o mesmo parse (e a mesma expansão).
+    can_fallback = not parsed.get("decoded") and not parsed.get("dtd_rejected")
     # JADX pode exportar o manifesto decodificado junto dos recursos. A saída é tratada como dado, não como comando.
     jadx = shutil.which("jadx")
-    if not parsed.get("decoded") and jadx:
+    if can_fallback and jadx:
         jadx_out = output_dir / "jadx_manifest"
         result = _run([jadx, "-d", str(jadx_out), "--no-src", str(path)], timeout=240)
         tools["jadx"] = {"returncode": result["returncode"], "stderr": result["stderr"]}
@@ -196,7 +254,7 @@ def analyze_manifest(path: Path, output_dir: Path) -> dict[str, Any]:
                 break
 
     apktool = shutil.which("apktool")
-    if not parsed.get("decoded") and apktool:
+    if can_fallback and apktool:
         apktool_out = output_dir / "apktool_manifest"
         result = _run([apktool, "d", "-f", "-s", "-o", str(apktool_out), str(path)], timeout=240)
         tools["apktool"] = {"returncode": result["returncode"], "stderr": result["stderr"]}
@@ -207,7 +265,7 @@ def analyze_manifest(path: Path, output_dir: Path) -> dict[str, Any]:
 
     # aapt2 pode fornecer ao menos a lista de permissões quando não conseguimos obter XML.
     aapt2 = shutil.which("aapt2")
-    if not parsed.get("decoded") and aapt2:
+    if can_fallback and aapt2:
         result = _run([aapt2, "dump", "permissions", str(path)], timeout=120)
         tools["aapt2"] = {"returncode": result["returncode"], "stderr": result["stderr"]}
         permission_names = sorted(set(re.findall(
